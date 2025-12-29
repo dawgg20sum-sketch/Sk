@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SK = "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"
 DEFAULT_PK = "pk_live_51HCxxcGh3Y40u4KfJV7rsBZCHfpHqWLvjyyVVSoPogRbVfrajg3TlvGP6HYz6h6ti81OOATYDgReNEw8UWB6zWs7005ziEfbdu"
-BOT_TOKEN = "7227861490:AAExsiHki6XXitOoiiP7hTF3uDauXouVN0w"
+BOT_TOKEN = "8455160553:AAH1iBoCM_gu85GmaK9Q8uJrQd_7hjyMrr0"
 ADMIN_IDS = [6307224822, 6028572049]
 STATS_FILE = "bot_stats.json"
 BANNED_USERS_FILE = "banned_users.json"
@@ -1131,3 +1131,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
