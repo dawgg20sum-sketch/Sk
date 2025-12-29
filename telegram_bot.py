@@ -8,6 +8,7 @@ import random
 import string
 import base64
 import asyncio
+import asyncpg
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -15,8 +16,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log', encoding='utf-8')
+        logging.StreamHandler()
     ]
 )
 
@@ -30,51 +30,95 @@ DEFAULT_SK = "sk_live_51HCxxcGh3Y40u4KfBMl516FPcbiPdWolRmXGRQHRkQMbldf4lLvd3I2Ql
 DEFAULT_PK = "pk_live_51HCxxcGh3Y40u4KfJV7rsBZCHfpHqWLvjyyVVSoPogRbVfrajg3TlvGP6HYz6h6ti81OOATYDgReNEw8UWB6zWs7005ziEfbdu"
 BOT_TOKEN = "8455160553:AAH1iBoCM_gu85GmaK9Q8uJrQd_7hjyMrr0"
 ADMIN_IDS = [6307224822, 6028572049]
-STATS_FILE = "bot_stats.json"
-BANNED_USERS_FILE = "banned_users.json"
-SK_CONFIG_FILE = "sk_config.json"
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+db_pool = None
 
 
-def load_sk_config():
-    if os.path.exists(SK_CONFIG_FILE):
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set, database features disabled")
+        return False
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        async with db_pool.acquire() as conn:
+            await conn.execute('''CREATE TABLE IF NOT EXISTS stats (user_id TEXT PRIMARY KEY, username TEXT, total_checked INTEGER DEFAULT 0, total_live INTEGER DEFAULT 0)''')
+            await conn.execute('''CREATE TABLE IF NOT EXISTS banned_users (user_id BIGINT PRIMARY KEY)''')
+            await conn.execute('''CREATE TABLE IF NOT EXISTS sk_config (id INTEGER PRIMARY KEY DEFAULT 1, sk TEXT, pk TEXT)''')
+            existing = await conn.fetchval('SELECT COUNT(*) FROM sk_config')
+            if existing == 0:
+                await conn.execute('INSERT INTO sk_config (id, sk, pk) VALUES (1, $1, $2)', DEFAULT_SK, DEFAULT_PK)
+        logger.info("Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Database init failed: {e}")
+        return False
+
+
+async def load_sk_config():
+    if db_pool:
         try:
-            with open(SK_CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow('SELECT sk, pk FROM sk_config WHERE id = 1')
+                if row:
+                    return {'sk': row['sk'], 'pk': row['pk']}
+        except Exception as e:
+            logger.error(f"Error loading SK config: {e}")
     return {'sk': DEFAULT_SK, 'pk': DEFAULT_PK}
 
 
-def save_sk_config(config):
-    with open(SK_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-
-
-def get_global_sk():
-    return load_sk_config().get('sk', DEFAULT_SK)
-
-
-def get_global_pk():
-    return load_sk_config().get('pk', DEFAULT_PK)
-
-
-def load_banned_users():
-    if os.path.exists(BANNED_USERS_FILE):
+async def save_sk_config(config):
+    if db_pool:
         try:
-            with open(BANNED_USERS_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return []
+            async with db_pool.acquire() as conn:
+                await conn.execute('UPDATE sk_config SET sk = $1, pk = $2 WHERE id = 1', config['sk'], config['pk'])
+        except Exception as e:
+            logger.error(f"Error saving SK config: {e}")
+
+
+async def get_global_sk():
+    config = await load_sk_config()
+    return config.get('sk', DEFAULT_SK)
+
+
+async def get_global_pk():
+    config = await load_sk_config()
+    return config.get('pk', DEFAULT_PK)
+
+
+async def load_banned_users():
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch('SELECT user_id FROM banned_users')
+                return [row['user_id'] for row in rows]
+        except Exception as e:
+            logger.error(f"Error loading banned users: {e}")
     return []
 
 
-def save_banned_users(banned):
-    with open(BANNED_USERS_FILE, 'w') as f:
-        json.dump(banned, f, indent=2)
+async def save_banned_user(user_id):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute('INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING', user_id)
+        except Exception as e:
+            logger.error(f"Error saving banned user: {e}")
 
 
-def is_banned(user_id):
-    return user_id in load_banned_users()
+async def remove_banned_user(user_id):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute('DELETE FROM banned_users WHERE user_id = $1', user_id)
+        except Exception as e:
+            logger.error(f"Error removing banned user: {e}")
+
+
+async def is_banned(user_id):
+    banned = await load_banned_users()
+    return user_id in banned
 
 
 def is_admin(user_id):
@@ -186,36 +230,31 @@ async def get_pk_from_sk(sk: str, timeout: int = 15):
         return None
 
 
-def load_stats():
-    if os.path.exists(STATS_FILE):
+async def load_stats():
+    if db_pool:
         try:
-            with open(STATS_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch('SELECT user_id, username, total_checked, total_live FROM stats')
+                return {row['user_id']: {'username': row['username'], 'total_checked': row['total_checked'], 'total_live': row['total_live']} for row in rows}
+        except Exception as e:
+            logger.error(f"Error loading stats: {e}")
     return {}
 
 
-def save_stats(stats):
-    with open(STATS_FILE, 'w') as f:
-        json.dump(stats, f, indent=2)
-
-
-def update_user_stats(user_id, username, cards_checked, live_count):
-    stats = load_stats()
-    user_id_str = str(user_id)
-    
-    if user_id_str not in stats:
-        stats[user_id_str] = {
-            'username': username,
-            'total_checked': 0,
-            'total_live': 0
-        }
-    
-    stats[user_id_str]['username'] = username
-    stats[user_id_str]['total_checked'] = stats[user_id_str].get('total_checked', 0) + cards_checked
-    stats[user_id_str]['total_live'] = stats[user_id_str].get('total_live', 0) + live_count
-    save_stats(stats)
+async def update_user_stats(user_id, username, cards_checked, live_count):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO stats (user_id, username, total_checked, total_live)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = $2,
+                        total_checked = stats.total_checked + $3,
+                        total_live = stats.total_live + $4
+                ''', str(user_id), username, cards_checked, live_count)
+        except Exception as e:
+            logger.error(f"Error updating stats: {e}")
 
 
 async def get_payment_method(card_number, exp_month, exp_year, cvc, pk):
@@ -348,7 +387,7 @@ async def process_card(sk, card_data):
     exp_year = card_data['exp_year']
     cvc = card_data['cvc']
     
-    pk = get_global_pk()
+    pk = await get_global_pk()
     logger.debug(f"Using global PK: {pk[:20]}...")
     
     pm_id, pm_error = await get_payment_method(card_number, exp_month, exp_year, cvc, pk)
@@ -392,20 +431,23 @@ async def process_batch_cards(sk, cards, update, context, session_key, user_id, 
     live_cards = []
     dead_count = 0
     failed_count = 0
+    checked_count = 0
     latest_response = "Waiting to start..."
     start_time = time.time()
+    was_stopped = False
     
     try:
         logger.info(f"Starting batch check for user {user_id} (@{username}): {len(cards)} cards")
         for idx, card_data in enumerate(cards, 1):
             if context.bot_data.get('active_sessions', {}).get(session_key, {}).get('stopped', False):
                 logger.info(f"Batch check stopped by user {user_id}")
+                was_stopped = True
                 elapsed = int(time.time() - start_time)
                 stop_msg = (
                     "╭────────────────────╮\n"
                     "│   ⛔ 𝗦𝘁𝗼𝗽𝗽𝗲𝗱        │\n"
                     "╰────────────────────╯\n\n"
-                    f"⏳ {idx-1}/{len(cards)} cards checked\n"
+                    f"⏳ {checked_count}/{len(cards)} cards checked\n"
                     f"✅ {len(live_cards)} | ❌ {dead_count} | ⚠️ {failed_count} | ⌛ {elapsed}s"
                 )
                 try:
@@ -418,6 +460,7 @@ async def process_batch_cards(sk, cards, update, context, session_key, user_id, 
             logger.debug(f"Processing card {idx}/{len(cards)}")
             result = await process_card(sk, card_data)
             logger.debug(f"Card {idx} result: {result['status']}")
+            checked_count = idx
             
             if result['status'] == 'live':
                 live_cards.append(result['full_card'])
@@ -463,36 +506,38 @@ async def process_batch_cards(sk, cards, update, context, session_key, user_id, 
             if idx < len(cards):
                 await asyncio.sleep(0.5)
         
-        elapsed = int(time.time() - start_time)
-        summary = (
-            "╭────────────────────╮\n"
-            "│    📊 𝗥𝗲𝘀𝘂𝗹𝘁        │\n"
-            "╰────────────────────╯\n\n"
-            f"✅ Live: {len(live_cards)}\n"
-            f"❌ Declined: {dead_count}\n"
-            f"⚠️ Failed: {failed_count}\n\n"
-            f"📝 Total: {len(cards)} | ⌛ {elapsed}s"
-        )
+        if not was_stopped:
+            elapsed = int(time.time() - start_time)
+            summary = (
+                "╭────────────────────╮\n"
+                "│    📊 𝗥𝗲𝘀𝘂𝗹𝘁        │\n"
+                "╰────────────────────╯\n\n"
+                f"✅ Live: {len(live_cards)}\n"
+                f"❌ Declined: {dead_count}\n"
+                f"⚠️ Failed: {failed_count}\n\n"
+                f"📝 Total: {len(cards)} | ⌛ {elapsed}s"
+            )
 
-        final_progress_text = (
-            "╭────────────────────╮\n"
-            "│   ✅ 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲𝗱      │\n"
-            "╰────────────────────╯\n\n"
-            f"✅ {len(live_cards)} | ❌ {dead_count} | ⚠️ {failed_count}"
-        )
-        
-        try:
-            await progress_msg.edit_text(final_progress_text)
-        except:
-            pass
-        
-        await update.message.reply_text(summary)
-        update_user_stats(user_id, username, len(cards), len(live_cards))
+            final_progress_text = (
+                "╭────────────────────╮\n"
+                "│   ✅ 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲𝗱      │\n"
+                "╰────────────────────╯\n\n"
+                f"✅ {len(live_cards)} | ❌ {dead_count} | ⚠️ {failed_count}"
+            )
+            
+            try:
+                await progress_msg.edit_text(final_progress_text)
+            except:
+                pass
+            
+            await update.message.reply_text(summary)
         logger.info(f"Batch check completed for user {user_id}: {len(live_cards)} live, {dead_count} dead, {failed_count} failed")
     except Exception as e:
         logger.error(f"Error in batch processing for user {user_id}: {str(e)}", exc_info=True)
         await update.message.reply_text(f"❌ Error processing cards: {str(e)}")
     finally:
+        if checked_count > 0:
+            await update_user_stats(user_id, username, checked_count, len(live_cards))
         if session_key in context.bot_data.get('active_sessions', {}):
             del context.bot_data['active_sessions'][session_key]
 
@@ -519,11 +564,11 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "Unknown"
     logger.info(f"/chk command from user {user_id} (@{username})")
     
-    if is_banned(user_id):
+    if await is_banned(user_id):
         await update.message.reply_text("🚫 BANNED")
         return
     
-    sk = get_global_sk()
+    sk = await get_global_sk()
     if not sk:
         logger.error("Global SK is not set")
         await update.message.reply_text("❌ Global SK key is not configured. Contact admin.")
@@ -629,7 +674,7 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🟢 Status: Live{bin_text}"
                 )
                 await update.message.reply_text(live_msg, parse_mode='Markdown')
-                update_user_stats(user_id, username, 1, 1)
+                await update_user_stats(user_id, username, 1, 1)
             elif result['status'] == 'dead':
                 bin_info = await get_bin_info(cards[0]['number'])
                 bin_text = format_bin_info(bin_info)
@@ -644,7 +689,7 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔴 {reason_text}{decline_info}{bin_text}"
                 )
                 await update.message.reply_text(dead_msg, parse_mode='Markdown')
-                update_user_stats(user_id, username, 1, 0)
+                await update_user_stats(user_id, username, 1, 0)
             else:
                 fail_msg = (
                     "┏━━━━━━━⍟\n"
@@ -654,7 +699,7 @@ async def chk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 await update.message.reply_text(fail_msg)
-                update_user_stats(user_id, username, 1, 0)
+                await update_user_stats(user_id, username, 1, 0)
         else:
             user_id = update.message.from_user.id
             username = update.message.from_user.username or update.message.from_user.first_name or "Unknown"
@@ -684,7 +729,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "Unknown"
     logger.info(f"/stats command from user {user_id} (@{username})")
     
-    stats = load_stats()
+    stats = await load_stats()
     
     if not stats:
         message = (
@@ -706,12 +751,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sorted_users = sorted(stats.items(), key=lambda x: x[1].get('total_live', 0), reverse=True)
 
     for user_id_str, user_stats in sorted_users:
-        username = user_stats.get('username', 'Unknown')
+        uname = user_stats.get('username', 'Unknown')
         total_live = user_stats.get('total_live', 0)
         total_checked = user_stats.get('total_checked', 0)
         total_checked_all += total_checked
         total_live_all += total_live
-        message += f"👤 @{username} — ✅ {total_live} | 📝 {total_checked}\n"
+        message += f"👤 @{uname} — ✅ {total_live} | 📝 {total_checked}\n"
 
     message += "━━━━━━━━━━━━━━━━━━━━\n"
     message += f"📊 Total — ✅ {total_live_all} | 📝 {total_checked_all}"
@@ -746,11 +791,11 @@ async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message += "┗━━━━━━━━━━━⊛\n\n"
 
     for session_key, session_data in active_sessions.items():
-        username = session_data.get('username', 'Unknown')
+        uname = session_data.get('username', 'Unknown')
         checked = session_data.get('checked', 0)
         total = session_data.get('total', 0)
         live = session_data.get('live', 0)
-        message += f"👤 @{username} — {checked}/{total} | ✅ {live}\n"
+        message += f"👤 @{uname} — {checked}/{total} | ✅ {live}\n"
 
     await update.message.reply_text(message)
 
@@ -804,13 +849,12 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cannot ban an admin.")
         return
     
-    banned = load_banned_users()
+    banned = await load_banned_users()
     if target_user_id in banned:
         await update.message.reply_text(f"⚠️ User {target_user_id} is already banned.")
         return
     
-    banned.append(target_user_id)
-    save_banned_users(banned)
+    await save_banned_user(target_user_id)
     
     await update.message.reply_text(f"✅ User {target_user_id} has been banned.")
     logger.info(f"Admin {user_id} banned user {target_user_id}")
@@ -835,13 +879,12 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID. Must be a number.")
         return
     
-    banned = load_banned_users()
+    banned = await load_banned_users()
     if target_user_id not in banned:
         await update.message.reply_text(f"⚠️ User {target_user_id} is not banned.")
         return
     
-    banned.remove(target_user_id)
-    save_banned_users(banned)
+    await remove_banned_user(target_user_id)
     
     await update.message.reply_text(f"✅ User {target_user_id} has been unbanned.")
     logger.info(f"Admin {user_id} unbanned user {target_user_id}")
@@ -856,7 +899,7 @@ async def bans_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You don't have permission to use this command.")
         return
     
-    banned = load_banned_users()
+    banned = await load_banned_users()
     
     if not banned:
         await update.message.reply_text("📋 No banned users.")
@@ -925,14 +968,13 @@ async def setsk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid PK format. Must start with 'pk_'")
         return
     
-    config = load_sk_config()
+    config = await load_sk_config()
     config['sk'] = sk
     if pk:
         config['pk'] = pk
-    save_sk_config(config)
+    await save_sk_config(config)
     
-    masked_sk = f"{sk[:12]}...{sk[-6:]}"
-    msg = f"✅ Global SK updated: `{masked_sk}`"
+    msg = f"✅ Global SK updated: `{sk}`"
     if pk:
         masked_pk = f"{pk[:12]}...{pk[-6:]}"
         msg += f"\n✅ Global PK updated: `{masked_pk}`"
@@ -951,7 +993,7 @@ async def removesk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     config = {'sk': DEFAULT_SK, 'pk': DEFAULT_PK}
-    save_sk_config(config)
+    await save_sk_config(config)
     
     await update.message.reply_text("✅ Global SK/PK reset to default.")
     logger.info(f"Admin {user_id} reset global SK/PK to default")
@@ -966,7 +1008,7 @@ async def viewsk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You don't have permission to use this command.")
         return
     
-    config = load_sk_config()
+    config = await load_sk_config()
     sk = config.get('sk', 'Not set')
     pk = config.get('pk', 'Not set')
     
@@ -1089,6 +1131,12 @@ async def sk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
+async def post_init(application):
+    await init_db()
+    if 'active_sessions' not in application.bot_data:
+        application.bot_data['active_sessions'] = {}
+
+
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         logger.error("BOT_TOKEN is not set in the script")
@@ -1100,7 +1148,7 @@ def main():
     logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
     logger.info("=" * 50)
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("chk", chk_command))
@@ -1116,9 +1164,6 @@ def main():
     application.add_handler(CommandHandler("removesk", removesk_command))
     application.add_handler(CommandHandler("viewsk", viewsk_command))
     
-    if 'active_sessions' not in application.bot_data:
-        application.bot_data['active_sessions'] = {}
-    
     logger.info("Bot is running and ready to receive commands...")
     print("Bot is running...")
     
@@ -1131,4 +1176,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
